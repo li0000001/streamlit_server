@@ -1,0 +1,22 @@
+# 这是进入后台管理页面的密码，请务必修改成一个复杂的密码！
+SECRET_KEY = "your_secret_password_here"
+
+# --- 以下为可选配置，如果留空，脚本会自动生成 ---
+
+# 你可以指定一个固定的UUID，否则会随机生成
+# UUID_STR = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# 你可以指定一个固定的本地端口，否则会随机选择
+# PORT_VM_WS = 12345
+
+# 如果你有自己的域名并已托管到Cloudflare，可以在这里填写
+# CUSTOM_DOMAIN = "your.custom.domain.com"
+
+# 如果你使用Cloudflare Tunnel并有固定的Token，可以在这里填写
+# ARGO_TOKEN = "your_argo_tunnel_token_here"
+
+
+------------------------------------------
+设置 GitHub Actions (这是实现自动化的关键)：
+在您的 GitHub 项目仓库中，创建文件 .github/workflows/wakeup.yml。
+将以下代码粘贴进去，并将 URL 替换成您自己的 Streamlit 应用 URL。

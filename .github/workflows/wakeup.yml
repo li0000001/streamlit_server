@@ -1,0 +1,14 @@
+name: Wake Up Streamlit App
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # 每15分钟运行一次
+  workflow_dispatch:
+
+jobs:
+  wake_up:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Send GET request to Streamlit app
+      run: |
+        curl -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36" "https://your-streamlit-app-url.streamlit.app"
