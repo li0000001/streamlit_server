@@ -3,7 +3,9 @@ name: Wake Up Streamlit App (Advanced Browser Simulation)
 on:
   schedule:
     # 每15分钟运行一次
-    - cron: '*/15 * * * *'
+   #- cron: '*/15 * * * *'
+   # 每8个小时运行一次 (在 0:00, 8:00, 16:00 触发)
+   - cron: '0 */8 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
