@@ -8,8 +8,6 @@ import random
 import time
 import shutil
 import re
-import base64
-import hashlib
 import subprocess
 import platform
 import uuid
@@ -30,8 +28,6 @@ LOG_FILE = INSTALL_DIR / "argo.log"
 SB_LOG_FILE = INSTALL_DIR / "sb.log"
 ALL_NODES_FILE = INSTALL_DIR / "allnodes.txt"
 GEO_FILE = INSTALL_DIR / "geo.json"
-# 订阅文件目录：必须与 app.py 同级的 ./static/（Streamlit 只服务这个目录）
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # --- 辅助函数 ---
 
@@ -173,112 +169,6 @@ def get_exit_country():
             continue
     return None, None
 
-# --- 订阅文件 ---
-
-def get_sub_token(uuid_str=""):
-    """订阅访问令牌：优先读 Secrets 的 SUB_TOKEN，否则由 UUID 确定性派生（重启不变）。"""
-    try:
-        tok = str(st.secrets.get("SUB_TOKEN", "")).strip()
-        if tok:
-            return tok
-    except Exception:
-        pass
-    seed = str(uuid_str) or "streamlit"
-    return hashlib.sha256(("sub:" + seed).encode("utf-8")).hexdigest()[:16]
-
-def get_app_base_url():
-    """推断应用的公网访问地址，用于拼订阅链接。可在 Secrets 里用 APP_URL 覆盖。"""
-    try:
-        custom = str(st.secrets.get("APP_URL", "")).strip().rstrip("/")
-        if custom:
-            return custom
-    except Exception:
-        pass
-    try:
-        headers = st.context.headers
-        host = headers.get("host") or headers.get("Host") or ""
-        proto = (headers.get("x-forwarded-proto") or headers.get("X-Forwarded-Proto") or "https").lower()
-        if host:
-            return f"{proto}://{host}"
-    except Exception:
-        pass
-    return ""
-
-def _yaml_quote(value):
-    """生成带双引号且正确转义的 YAML 字符串。"""
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-def build_clash_yaml(links):
-    """把 vless:// 链接渲染成 Clash.Meta / mihomo 可用的订阅配置。"""
-    proxies = []
-    for link in links:
-        if not link.startswith("vless://"):
-            continue
-        u = urllib.parse.urlsplit(link)
-        q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-        proxies.append({
-            "name": urllib.parse.unquote(u.fragment) or "node",
-            "server": u.hostname or "",   # urlsplit 已经去掉 IPv6 的方括号
-            "port": u.port or 443,
-            "uuid": u.username or "",
-            "sni": q.get("sni", ""),
-            "host": q.get("host", ""),
-            "path": q.get("path", "/"),
-        })
-    if not proxies:
-        return ""
-    out = [
-        "# Clash.Meta / mihomo subscription (VLESS + WS + TLS)",
-        "mixed-port: 7890",
-        "socks-port: 7891",
-        "allow-lan: false",
-        "mode: rule",
-        "log-level: info",
-        "ipv6: false",
-        "proxies:",
-    ]
-    for p in proxies:
-        out += [
-            f"  - name: {_yaml_quote(p['name'])}",
-            "    type: vless",
-            f"    server: {_yaml_quote(p['server'])}",
-            f"    port: {p['port']}",
-            f"    uuid: {_yaml_quote(p['uuid'])}",
-            "    network: ws",
-            "    tls: true",
-            "    udp: true",
-            f"    servername: {_yaml_quote(p['sni'])}",
-            "    client-fingerprint: chrome",
-            "    ws-opts:",
-            f"      path: {_yaml_quote(p['path'])}",
-            "      headers:",
-            f"        Host: {_yaml_quote(p['host'])}",
-        ]
-    out += ["proxy-groups:", '  - name: "PROXY"', "    type: select", "    proxies:"]
-    out += [f"      - {_yaml_quote(p['name'])}" for p in proxies]
-    out += ["rules:", "  - MATCH,PROXY", ""]
-    return "\n".join(out)
-
-def build_subscription_files(links, uuid_str=""):
-    """生成订阅文件到 ./static/，返回 (通用订阅相对路径, Clash相对路径)，失败返回 (None, None)。"""
-    if not links:
-        return None, None
-    try:
-        STATIC_DIR.mkdir(parents=True, exist_ok=True)
-        token = get_sub_token(uuid_str)
-        txt_name, yaml_name = f"sub_{token}.txt", f"sub_{token}.yaml"
-        (STATIC_DIR / txt_name).write_text(
-            base64.b64encode("\n".join(links).encode("utf-8")).decode("ascii"),
-            encoding="ascii")
-        yaml_rel = None
-        yaml_body = build_clash_yaml(links)
-        if yaml_body:
-            (STATIC_DIR / yaml_name).write_text(yaml_body, encoding="utf-8")
-            yaml_rel = f"app/static/{yaml_name}"
-        return f"app/static/{txt_name}", yaml_rel
-    except Exception:
-        return None, None
-
 # --- 核心逻辑 ---
 
 def generate_all_configs(domain, uuid_str, port_vm_ws):
@@ -309,9 +199,6 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
     
     # 将所有链接写入文件，以便下次直接读取
     ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
-
-    # 同步生成订阅文件（通用 base64 .txt + Clash .yaml）
-    build_subscription_files(all_links, uuid_str)
 
     # 准备要在UI上显示的输出文本
     list_output_text = f"""
@@ -454,39 +341,6 @@ def render_main_ui(config):
     if output_to_show:
         st.subheader("节点信息")
         st.code(output_to_show)
-
-    render_subscription_ui(config)
-
-def render_subscription_ui(config):
-    """渲染订阅链接区域；文件缺失但已有节点缓存时自动补生成。"""
-    st.subheader("🔗 订阅链接")
-    uuid_str = config.get("uuid_str", "")
-    token = get_sub_token(uuid_str)
-    txt_name, yaml_name = f"sub_{token}.txt", f"sub_{token}.yaml"
-
-    # 自愈：容器重启或静态文件丢失后，从节点缓存重建订阅
-    if not (STATIC_DIR / txt_name).exists() and ALL_NODES_FILE.exists():
-        cached = [l for l in ALL_NODES_FILE.read_text(encoding="utf-8").splitlines()
-                  if l.startswith("vless://")]
-        if cached:
-            build_subscription_files(cached, uuid_str)
-
-    base = get_app_base_url()
-    if not base:
-        st.warning("无法识别应用访问地址。请在 Streamlit 的 **Secrets** 里添加 `APP_URL`，"
-                   "例如 `https://你的应用名.streamlit.app`")
-        return
-    if not (STATIC_DIR / txt_name).exists():
-        st.info("订阅文件尚未生成，请先点击「🚀 强制重启服务」。")
-        return
-
-    c1, c2 = st.columns(2)
-    c1.code(f"{base}/app/static/{txt_name}")
-    c2.code(f"{base}/app/static/{yaml_name}")
-    st.caption("📄 `.txt` = 通用 base64 订阅 · v2rayN / NekoBox / Karing / sing-box / Shadowrocket / V2Box")
-    st.caption("📄 `.yaml` = Clash.Meta · mihomo 配置 · Clash Verge / OpenClash / Stash"
-               "（原版 Clash Premium 不支持 VLESS）")
-    st.caption("ℹ️ 节点变化后点「🚀 强制重启服务」，订阅内容会同步更新。")
 
 def render_login_ui(secret_key):
     """渲染伪装的天气查询登录界面。"""
