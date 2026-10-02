@@ -8,12 +8,12 @@ import random
 import time
 import shutil
 import re
-import base64
 import subprocess
 import platform
 import uuid
 from pathlib import Path
 import urllib.request
+import urllib.parse
 import tarfile
 import streamlit as st
 
@@ -43,15 +43,23 @@ def download_file(url, target_path, silent=False):
             st.error(f"下载失败: {url}, 错误: {e}")
         return False
 
-def generate_vmess_link(config):
-    """根据配置字典生成Vmess链接字符串。"""
-    vmess_obj = {
-        "v": "2", "ps": config.get("ps"), "add": config.get("add"), "port": str(config.get("port")),
-        "id": config.get("id"), "aid": "0", "scy": "auto", "net": "ws", "type": "none",
-        "host": config.get("host"), "path": "/", "tls": "tls", "sni": config.get("sni")
-    }
-    vmess_str = json.dumps(vmess_obj, separators=(',', ':'))
-    return f"vmess://{base64.b64encode(vmess_str.encode('utf-8')).decode('utf-8').rstrip('=')}"
+def generate_vless_link(config):
+    """根据配置字典生成 VLESS 链接字符串（WebSocket + TLS）。"""
+    query = urllib.parse.urlencode({
+        "type": "ws",
+        "encryption": "none",
+        "security": "tls",
+        "sni": config.get("sni") or "",
+        "host": config.get("host") or "",
+        "path": "/",
+    })
+    name = urllib.parse.quote(config.get("ps") or "", safe="")
+    # IPv6 地址在 URL 中必须用方括号包裹，否则端口解析会出错
+    address = str(config.get("add") or "")
+    if ":" in address and not address.startswith("["):
+        address = f"[{address}]"
+    return (f"vless://{config.get('id')}@{address}:{config.get('port')}"
+            f"?{query}#{name}")
 
 def get_tunnel_domain():
     """从argo日志文件中尝试读取Cloudflare临时隧道域名。"""
@@ -168,7 +176,7 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
     # 让 Streamlit 服务端查询自己的出口IP归属地，用国家名做节点名前缀
     country, exit_ip = get_exit_country()
     region = country or "未知"
-    protocol = "VMWS-TLS"
+    protocol = "VLWS-TLS"
     all_links = []
     # 使用一些Cloudflare的优选IP来生成节点
     cf_ips_tls = {"2606:4700::": "443",
@@ -186,8 +194,8 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
             "104.20.0.0": "2087"}
     # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，1~13）
     for idx, (ip, port) in enumerate(cf_ips_tls.items(), start=1):
-        all_links.append(generate_vmess_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
-    all_links.append(generate_vmess_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_tls) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+        all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
+    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_tls) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
     
     # 将所有链接写入文件，以便下次直接读取
     ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
@@ -203,7 +211,7 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
 - **本地端口:** `{port_vm_ws}`
 - **WebSocket路径:** `/`
 ---
-**Vmess 链接 (可复制):**
+**VLESS 链接 (可复制):**
 """ + "\n".join(all_links)
     
     # 将UI文本也写入文件
@@ -257,7 +265,12 @@ def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False
             if not success: return False, msg
 
         # 创建 sing-box 配置文件
-        sb_config = {"log": {"level": "info"}, "inbounds": [{"type": "vmess", "tag": "vmess-in", "listen": "127.0.0.1", "listen_port": port_vm_ws, "sniff": True, "users": [{"uuid": uuid_str, "alterId": 0}], "transport": {"type": "ws", "path": "/"}}], "outbounds": [{"type": "direct"}]}
+        sb_config = {"log": {"level": "info"},
+                     "inbounds": [{"type": "vless", "tag": "vless-in", "listen": "127.0.0.1",
+                                   "listen_port": port_vm_ws, "sniff": True,
+                                   "users": [{"uuid": uuid_str}],
+                                   "transport": {"type": "ws", "path": "/"}}],
+                     "outbounds": [{"type": "direct"}]}
         (INSTALL_DIR / "sb.json").write_text(json.dumps(sb_config, indent=2))
         
         # 启动 sing-box 和 cloudflared 进程
