@@ -114,7 +114,13 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
             "104.19.0.0": "2083",
             "104.20.0.0": "2087"}
     for ip, port in cf_ips_tls.items():
-        all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-{hostname}-{ip.split('.')[2]}-{port}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
+        # 安全生成标签：IPv6 / 两段域名 / 四段IP 都不会 IndexError，且尽量可读
+        parts = [p for p in ip.replace(':', '.').split('.') if p]
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            label = parts[1]                        # 104.16.0.0 -> 16
+        else:
+            label = parts[-2] if len(parts) >= 2 else parts[0]
+        all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-{hostname}-{label}-{port}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
     all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-Direct-{hostname}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
     
     # 将所有链接写入文件，以便下次直接读取
