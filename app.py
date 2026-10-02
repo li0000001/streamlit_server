@@ -9,7 +9,6 @@ import time
 import shutil
 import re
 import base64
-import socket
 import subprocess
 import platform
 import uuid
@@ -28,6 +27,7 @@ LIST_FILE = INSTALL_DIR / "list.txt"
 LOG_FILE = INSTALL_DIR / "argo.log"
 SB_LOG_FILE = INSTALL_DIR / "sb.log"
 ALL_NODES_FILE = INSTALL_DIR / "allnodes.txt"
+GEO_FILE = INSTALL_DIR / "geo.json"
 
 # --- 辅助函数 ---
 
@@ -58,7 +58,7 @@ def get_tunnel_domain():
     for _ in range(15): # 最多等待30秒
         if LOG_FILE.exists():
             try:
-                log_content = LOG_FILE.read_text()
+                log_content = LOG_FILE.read_text(encoding="utf-8", errors="ignore")
                 match = re.search(r'https://([a-zA-Z0-9.-]+\.trycloudflare\.com)', log_content)
                 if match: return match.group(1)
             except Exception: pass
@@ -93,11 +93,82 @@ def is_service_running():
         # 如果PID文件内容错误、进程不存在或文件找不到，都视为服务未运行
         return False
 
+# --- 出口IP归属地 ---
+
+# 国家代码 -> 中文名（未收录的回退到接口返回的原始名称）
+COUNTRY_CN = {
+    "AF": "阿富汗", "AL": "阿尔巴尼亚", "DZ": "阿尔及利亚", "AR": "阿根廷", "AM": "亚美尼亚",
+    "AU": "澳大利亚", "AT": "奥地利", "AZ": "阿塞拜疆", "BH": "巴林", "BD": "孟加拉国",
+    "BY": "白俄罗斯", "BE": "比利时", "BZ": "伯利兹", "BO": "玻利维亚", "BA": "波黑",
+    "BR": "巴西", "BN": "文莱", "BG": "保加利亚", "KH": "柬埔寨", "CM": "喀麦隆",
+    "CA": "加拿大", "CL": "智利", "CN": "中国", "CO": "哥伦比亚", "CR": "哥斯达黎加",
+    "HR": "克罗地亚", "CY": "塞浦路斯", "CZ": "捷克", "DK": "丹麦", "DO": "多米尼加",
+    "EC": "厄瓜多尔", "EG": "埃及", "EE": "爱沙尼亚", "ET": "埃塞俄比亚", "FI": "芬兰",
+    "FR": "法国", "GE": "格鲁吉亚", "DE": "德国", "GH": "加纳", "GR": "希腊",
+    "GT": "危地马拉", "HK": "中国香港", "HN": "洪都拉斯", "HU": "匈牙利", "IS": "冰岛",
+    "IN": "印度", "ID": "印度尼西亚", "IR": "伊朗", "IQ": "伊拉克", "IE": "爱尔兰",
+    "IL": "以色列", "IT": "意大利", "CI": "科特迪瓦", "JM": "牙买加", "JP": "日本",
+    "JO": "约旦", "KZ": "哈萨克斯坦", "KE": "肯尼亚", "KW": "科威特", "KG": "吉尔吉斯斯坦",
+    "LA": "老挝", "LV": "拉脱维亚", "LB": "黎巴嫩", "LT": "立陶宛", "LU": "卢森堡",
+    "MO": "中国澳门", "MG": "马达加斯加", "MY": "马来西亚", "MT": "马耳他", "MU": "毛里求斯",
+    "MX": "墨西哥", "MD": "摩尔多瓦", "MC": "摩纳哥", "MN": "蒙古", "ME": "黑山",
+    "MA": "摩洛哥", "MM": "缅甸", "NA": "纳米比亚", "NP": "尼泊尔", "NL": "荷兰",
+    "NZ": "新西兰", "NI": "尼加拉瓜", "NG": "尼日利亚", "KP": "朝鲜", "MK": "北马其顿",
+    "NO": "挪威", "OM": "阿曼", "PK": "巴基斯坦", "PA": "巴拿马", "PY": "巴拉圭",
+    "PE": "秘鲁", "PH": "菲律宾", "PL": "波兰", "PT": "葡萄牙", "PR": "波多黎各",
+    "QA": "卡塔尔", "RO": "罗马尼亚", "RU": "俄罗斯", "SA": "沙特阿拉伯", "RS": "塞尔维亚",
+    "SG": "新加坡", "SK": "斯洛伐克", "SI": "斯洛文尼亚", "ZA": "南非", "KR": "韩国",
+    "ES": "西班牙", "LK": "斯里兰卡", "SE": "瑞典", "CH": "瑞士", "SY": "叙利亚",
+    "TW": "中国台湾", "TJ": "塔吉克斯坦", "TZ": "坦桑尼亚", "TH": "泰国", "TN": "突尼斯",
+    "TR": "土耳其", "TM": "土库曼斯坦", "UG": "乌干达", "UA": "乌克兰", "AE": "阿联酋",
+    "GB": "英国", "US": "美国", "UY": "乌拉圭", "UZ": "乌兹别克斯坦", "VE": "委内瑞拉",
+    "VN": "越南", "YE": "也门", "ZM": "赞比亚", "ZW": "津巴布韦",
+}
+
+def get_exit_country():
+    """查询本机出口IP及其归属国家，结果缓存到 GEO_FILE。返回 (国家中文名, 出口IP)。"""
+    if GEO_FILE.exists():
+        try:
+            saved = json.loads(GEO_FILE.read_text(encoding="utf-8"))
+            if saved.get("country"):
+                return saved["country"], saved.get("ip", "")
+        except Exception:
+            pass
+
+    # 三个备用接口，依次尝试（都不要求 API Key）
+    apis = [
+        ("https://ipwho.is/",       lambda d: (d.get("country"), d.get("country_code"), d.get("ip"))),
+        ("https://ipapi.co/json/",  lambda d: (d.get("country_name"), d.get("country_code"), d.get("ip"))),
+        ("http://ip-api.com/json/", lambda d: (d.get("country"), d.get("countryCode"), d.get("query"))),
+    ]
+    for url, pick in apis:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            country_raw, code, ip = pick(data)
+            if not country_raw and not code:
+                continue
+            cn = COUNTRY_CN.get((code or "").upper()) or country_raw
+            try:
+                GEO_FILE.write_text(
+                    json.dumps({"country": cn, "code": code or "", "ip": ip or ""}, ensure_ascii=False),
+                    encoding="utf-8")
+            except Exception:
+                pass
+            return cn, ip or ""
+        except Exception:
+            continue
+    return None, None
+
 # --- 核心逻辑 ---
 
 def generate_all_configs(domain, uuid_str, port_vm_ws):
     """生成所有节点链接和配置文件，并返回用于UI显示的文本。"""
-    hostname = socket.gethostname()[:10]
+    # 让 Streamlit 服务端查询自己的出口IP归属地，用国家名做节点名前缀
+    country, exit_ip = get_exit_country()
+    region = country or "未知"
+    protocol = "VMWS-TLS"
     all_links = []
     # 使用一些Cloudflare的优选IP来生成节点
     cf_ips_tls = {"2606:4700::": "443",
@@ -113,24 +184,21 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
             "104.18.0.0": "2053",
             "104.19.0.0": "2083",
             "104.20.0.0": "2087"}
-    for ip, port in cf_ips_tls.items():
-        # 安全生成标签：IPv6 / 两段域名 / 四段IP 都不会 IndexError，且尽量可读
-        parts = [p for p in ip.replace(':', '.').split('.') if p]
-        if len(parts) == 4 and all(p.isdigit() for p in parts):
-            label = parts[1]                        # 104.16.0.0 -> 16
-        else:
-            label = parts[-2] if len(parts) >= 2 else parts[0]
-        all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-{hostname}-{label}-{port}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
-    all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-Direct-{hostname}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+    # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，1~13）
+    for idx, (ip, port) in enumerate(cf_ips_tls.items(), start=1):
+        all_links.append(generate_vmess_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
+    all_links.append(generate_vmess_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_tls) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
     
     # 将所有链接写入文件，以便下次直接读取
-    ALL_NODES_FILE.write_text("\n".join(all_links) + "\n")
+    ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
 
     # 准备要在UI上显示的输出文本
     list_output_text = f"""
 ✅ **服务已启动**
 ---
 - **域名 (Domain):** `{domain}`
+- **出口IP:** `{exit_ip or '查询失败'}`
+- **归属地:** `{region}`
 - **UUID:** `{uuid_str}`
 - **本地端口:** `{port_vm_ws}`
 - **WebSocket路径:** `/`
@@ -139,7 +207,7 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
 """ + "\n".join(all_links)
     
     # 将UI文本也写入文件
-    LIST_FILE.write_text(list_output_text)
+    LIST_FILE.write_text(list_output_text, encoding="utf-8")
     return list_output_text
 
 def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False):
@@ -247,7 +315,7 @@ def render_main_ui(config):
     
     if c3.button("📄 显示/刷新节点信息", use_container_width=True):
         if LIST_FILE.exists():
-            st.session_state.output = LIST_FILE.read_text()
+            st.session_state.output = LIST_FILE.read_text(encoding="utf-8")
         else:
             st.session_state.output = "节点信息文件不存在，请先启动服务。"
         st.rerun()
@@ -255,7 +323,7 @@ def render_main_ui(config):
     # 优先从会话状态中读取输出，如果为空则尝试从文件读取
     output_to_show = st.session_state.get('output', '')
     if not output_to_show and LIST_FILE.exists():
-        output_to_show = LIST_FILE.read_text()
+        output_to_show = LIST_FILE.read_text(encoding="utf-8")
         
     if output_to_show:
         st.subheader("节点信息")
