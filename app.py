@@ -100,7 +100,21 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
     hostname = socket.gethostname()[:10]
     all_links = []
     # 使用一些Cloudflare的优选IP来生成节点
-    cf_ips_tls = {"104.16.0.0": "443", "104.17.0.0": "8443", "104.18.0.0": "2053"}
+    cf_ips_tls = {"2606:4700::": "443",
+            "www.visa.com": "443",
+            "japan.com": "443",
+            "www.iplocation.net": "443",
+            "time.is": "443",
+            "ip.sb": "443",
+            "openai.com": "443",
+            "openai.com": "443",
+            "openai.com": "443",
+            "saas.sin.fan": "443",
+            "104.16.0.0": "443",
+            "104.17.0.0": "8443",
+            "104.18.0.0": "2053",
+            "104.19.0.0": "2083",
+            "104.20.0.0": "2087"}
     for ip, port in cf_ips_tls.items():
         all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-{hostname}-{ip.split('.')[2]}-{port}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
     all_links.append(generate_vmess_link({"ps": f"VMWS-TLS-Direct-{hostname}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
