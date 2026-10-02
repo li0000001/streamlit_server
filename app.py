@@ -107,8 +107,6 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
             "time.is": "443",
             "ip.sb": "443",
             "openai.com": "443",
-            "openai.com": "443",
-            "openai.com": "443",
             "saas.sin.fan": "443",
             "104.16.0.0": "443",
             "104.17.0.0": "8443",
