@@ -16,6 +16,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import ssl
+import socket
 import tarfile
 import streamlit as st
 
@@ -44,6 +45,19 @@ def download_file(url, target_path, silent=False):
         if not silent:
             st.error(f"下载失败: {url}, 错误: {e}")
         return False
+
+def resolve_ipv4(domain):
+    """把域名解析成 IPv4 地址列表（避免客户端拿到 AAAA 后走质量差的 IPv6）。"""
+    try:
+        infos = socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+        seen = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in seen:
+                seen.append(ip)
+        return seen
+    except Exception:
+        return []
 
 def generate_vless_link(config):
     """根据配置字典生成 VLESS 链接字符串（WebSocket + TLS）。"""
@@ -187,24 +201,33 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
     protocol = "VLWS-TLS"
     all_links = []
     # 使用一些Cloudflare的优选IP来生成节点（只保留 IPv4/域名，避免 IPv6 劣质路由导致连接失败）
-    cf_ips_tls = {"www.visa.com": "443",
-            "japan.com": "443",
-            "www.iplocation.net": "443",
-            "time.is": "443",
-            "ip.sb": "443",
-            "openai.com": "443",
-            "saas.sin.fan": "443",
+    cf_ips_tls = {
+            # 下面是 Cloudflare 官方公告的 IPv4 网段起点，纯 IPv4 字面量 + 443，
+            # 不依赖客户端本地 DNS 解析，最稳定。故意不用 www.visa.com 这类"掩护域名"：
+            # 它们每次要本地解析，解析到被污染/被限速的 IP 时就会随机失败。
             "104.16.0.0": "443",
-            "104.17.0.0": "8443",
-            "104.18.0.0": "2053",
-            "104.19.0.0": "2083",
-            "104.20.0.0": "2087"}
+            "104.17.0.0": "443",
+            "104.18.0.0": "443",
+            "104.19.0.0": "443",
+            "104.20.0.0": "443",
+            "104.21.0.0": "443",
+            "172.64.0.0": "443",
+            "172.65.0.0": "443",
+            "172.66.0.0": "443",
+            "172.67.0.0": "443"}
     # 再过滤一遍：地址里带冒号的是 IPv6，直接跳过（IPv6 路由不佳时会导致测试 -1）
     cf_ips_v4 = {ip: port for ip, port in cf_ips_tls.items() if ":" not in str(ip)}
-    # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，从 1 开始）
-    for idx, (ip, port) in enumerate(cf_ips_v4.items(), start=1):
+    # 最稳的 Direct 节点排在最前（Cloudflare 会按客户端网络自动选就近入点）
+    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-1-Direct", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+    # 服务器端提前把域名钉成 IPv4：客户端如果拿到 AAAA 就会走 IPv6，
+    # 而很多宽带的 IPv6 路由质量很差，会导致这个节点永远连不上。
+    for i, ip in enumerate(resolve_ipv4(domain)[:3], start=2):
+        all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-{i}-Direct4", "add": ip, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+    # 节点名格式：国家-协议名称-序号
+    idx = 2 + len(resolve_ipv4(domain)[:3])
+    for ip, port in cf_ips_v4.items():
         all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
-    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_v4) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+        idx += 1
     
     # 将所有链接写入文件，以便下次直接读取
     ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
