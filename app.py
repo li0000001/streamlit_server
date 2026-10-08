@@ -14,6 +14,8 @@ import uuid
 from pathlib import Path
 import urllib.request
 import urllib.parse
+import urllib.error
+import ssl
 import tarfile
 import streamlit as st
 
@@ -323,11 +325,35 @@ def uninstall_services():
 
 # --- UI 渲染函数 ---
 
-def get_diagnostics():
+def probe_tunnel(domain):
+    """服务器自己探测隧道是否真的可用（不依赖任何客户端）。"""
+    if not domain:
+        return "未提供域名，无法探测"
+    url = f"https://{domain}/"
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            return f"✅ 隧道可达！HTTP {resp.status}（直接访问 {url} 成功返回）"
+    except urllib.error.HTTPError as e:
+        # Cloudflare 会返回错误页面，HTTP 错误码本身说明隧道是通的（能到 CF 边缘）
+        if e.code == 530:
+            return f"⚠️ HTTP 530：域名未启用代理或 DNS 记录有问题（能连到 CF，但不是隧道）"
+        if e.code == 404:
+            return f"✅ 隧道可达！HTTP 404 说明请求已到达 Cloudflare（后端无此路径属正常）"
+        return f"⚠️ HTTP {e.code}：能到达 Cloudflare 边缘，但后端返回错误"
+    except Exception as e:
+        return f"❌ 探测失败: {type(e).__name__}: {e}"
+
+def get_diagnostics(domain=""):
     """收集运行状态、进程、端口、配置和日志尾部，用于排查节点全部 -1 的问题。"""
     out = ["=== 运行诊断 ==="]
     singbox_path = INSTALL_DIR / "sing-box"
     cloudflared_path = INSTALL_DIR / "cloudflared"
+
+    # 服务器端主动探测隧道（最权威的判断依据）
+    out.append("--- 服务器端隧道自检 ---")
+    out.append(probe_tunnel(domain))
 
     # 二进制与版本
     for label, p in (("sing-box", singbox_path), ("cloudflared", cloudflared_path)):
@@ -380,6 +406,18 @@ def get_diagnostics():
         else:
             out.append(f"[缺失] {label}: {path}")
 
+    # cloudflared 隧道注册状态（关键：precheck 通过 ≠ 隧道已连上）
+    if LOG_FILE.exists():
+        try:
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+            keys = ("registered tunnel connection", "unregistered tunnel connection",
+                    "failed", "error", "retry", "reconnect", "unable")
+            hits = [ln for ln in lines if any(k in ln.lower() for k in keys)]
+            out.append(f"--- cloudflared 隧道注册/错误关键行（共 {len(lines)} 行日志）---")
+            out.append("\n".join(hits[-25:]) if hits else "(没有任何注册或错误记录 —— 隧道可能从未连上 Cloudflare！)")
+        except Exception as e:
+            out.append(f"argo.log 解析失败: {e}")
+
     return "\n".join(out)
 
 def render_main_ui(config):
@@ -413,7 +451,7 @@ def render_main_ui(config):
         st.rerun()
 
     if c4.button("🔍 运行环境诊断", use_container_width=True):
-        st.session_state.output = get_diagnostics()
+        st.session_state.output = get_diagnostics(config.get("custom_domain", ""))
         st.rerun()
     
     # 优先从会话状态中读取输出，如果为空则尝试从文件读取
