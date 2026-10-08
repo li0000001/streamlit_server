@@ -374,6 +374,32 @@ def probe_tunnel(domain):
     except Exception as e:
         return f"❌ 探测失败: {type(e).__name__}: {e}"
 
+def analyze_connections():
+    """按来源 IP 统计成功/失败连接，判断是哪台设备在出问题。"""
+    if not SB_LOG_FILE.exists():
+        return "sb.log 不存在"
+    lines = SB_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+    # 提取每条连接的来源IP 和 结果
+    ip_ok, ip_fail = {}, {}
+    cur = None
+    for ln in lines:
+        m = re.search(r"inbound connection from (\[?[0-9a-fA-F:.]+\]?):\d+", ln)
+        if m:
+            cur = m.group(1)
+            continue
+        if cur and "outbound connection to" in ln:
+            ip_ok[cur] = ip_ok.get(cur, 0) + 1
+        elif cur and "process connection" in ln and "EOF" in ln:
+            ip_fail[cur] = ip_fail.get(cur, 0) + 1
+            cur = None
+    out = []
+    for ip in sorted(set(ip_ok) | set(ip_fail)):
+        ok = ip_ok.get(ip, 0)
+        fail = ip_fail.get(ip, 0)
+        rate = f"{ok * 100 // (ok + fail)}%" if (ok + fail) else "-"
+        out.append(f"  {ip}:  成功 {ok}  失败 {fail}  成功率 {rate}")
+    return "\n".join(out) if out else "  (没有解析到连接记录)"
+
 def get_diagnostics(domain=""):
     """收集运行状态、进程、端口、配置和日志尾部，用于排查节点全部 -1 的问题。"""
     out = ["=== 运行诊断 ==="]
@@ -425,6 +451,10 @@ def get_diagnostics(domain=""):
     if cfg.exists():
         out.append("--- 当前 sb.json ---")
         out.append(cfg.read_text(encoding="utf-8", errors="ignore")[:1000])
+
+    # 按来源 IP 统计连接成功率（区分是哪台设备出问题）
+    out.append("--- 按来源 IP 的连接成功率 ---")
+    out.append(analyze_connections())
 
     # 日志尾部
     for label, path in (("sing-box 日志 (sb.log)", SB_LOG_FILE), ("cloudflared 日志 (argo.log)", LOG_FILE)):
