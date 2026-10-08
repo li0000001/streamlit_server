@@ -241,7 +241,7 @@ def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False
         # 封装下载和安装过程
         def install_dependencies():
             if not singbox_path.exists():
-                sb_version, sb_name_actual = "1.9.0-beta.11", f"sing-box-1.9.0-beta.11-linux-{arch}"
+                sb_version, sb_name_actual = "1.14.2", f"sing-box-1.14.2-linux-{arch}"
                 tar_path = INSTALL_DIR / "sing-box.tar.gz"
                 if not download_file(f"https://github.com/SagerNet/sing-box/releases/download/v{sb_version}/{sb_name_actual}.tar.gz", tar_path, silent):
                     return False, "sing-box 下载失败。"
