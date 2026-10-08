@@ -266,9 +266,10 @@ def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False
             if not success: return False, msg
 
         # 创建 sing-box 配置文件
+        # 注意：不要加 "sniff" 等旧版 inbound 字段——sing-box 1.13+ 会直接拒绝该配置并退出
         sb_config = {"log": {"level": "info"},
                      "inbounds": [{"type": "vless", "tag": "vless-in", "listen": "127.0.0.1",
-                                   "listen_port": port_vm_ws, "sniff": True,
+                                   "listen_port": port_vm_ws,
                                    "users": [{"uuid": uuid_str}],
                                    "transport": {"type": "ws", "path": "/"}}],
                      "outbounds": [{"type": "direct"}]}
@@ -285,6 +286,24 @@ def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False
 
         # 等待并获取域名
         time.sleep(5)
+
+        # 验证进程没有启动即退出：配置不兼容时 sing-box 会立刻报错退出，
+        # 以前不检查会让界面显示"服务已启动"但所有节点实际都是 -1
+        def _log_tail(path, lines=12):
+            try:
+                return "\n".join(path.read_text(encoding="utf-8", errors="ignore").splitlines()[-lines:])
+            except Exception:
+                return "(无法读取日志)"
+
+        if sb_process.poll() is not None:
+            stop_services()
+            return False, (f"sing-box 启动失败 (exit code {sb_process.returncode})，"
+                           f"配置不兼容或端口被占用。日志最后几行：\n{_log_tail(SB_LOG_FILE)}")
+        if cf_process.poll() is not None:
+            stop_services()
+            return False, (f"cloudflared 启动失败 (exit code {cf_process.returncode})，"
+                           f"请检查 ARGO_TOKEN。日志最后几行：\n{_log_tail(LOG_FILE)}")
+
         final_domain = custom_domain or (get_tunnel_domain() if not argo_token else None)
         if not final_domain:
             return False, "未能确定隧道域名。请检查日志 (`.agsb/argo.log`)。"
