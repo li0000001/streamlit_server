@@ -178,9 +178,8 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
     region = country or "未知"
     protocol = "VLWS-TLS"
     all_links = []
-    # 使用一些Cloudflare的优选IP来生成节点
-    cf_ips_tls = {"2606:4700::": "443",
-            "www.visa.com": "443",
+    # 使用一些Cloudflare的优选IP来生成节点（只保留 IPv4/域名，避免 IPv6 劣质路由导致连接失败）
+    cf_ips_tls = {"www.visa.com": "443",
             "japan.com": "443",
             "www.iplocation.net": "443",
             "time.is": "443",
@@ -192,10 +191,12 @@ def generate_all_configs(domain, uuid_str, port_vm_ws):
             "104.18.0.0": "2053",
             "104.19.0.0": "2083",
             "104.20.0.0": "2087"}
-    # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，1~13）
-    for idx, (ip, port) in enumerate(cf_ips_tls.items(), start=1):
+    # 再过滤一遍：地址里带冒号的是 IPv6，直接跳过（IPv6 路由不佳时会导致测试 -1）
+    cf_ips_v4 = {ip: port for ip, port in cf_ips_tls.items() if ":" not in str(ip)}
+    # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，从 1 开始）
+    for idx, (ip, port) in enumerate(cf_ips_v4.items(), start=1):
         all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
-    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_tls) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
+    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_v4) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
     
     # 将所有链接写入文件，以便下次直接读取
     ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
