@@ -311,7 +311,13 @@ def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False
             sb_process = subprocess.Popen([str(singbox_path), 'run', '-c', 'sb.json'], cwd=INSTALL_DIR, stdout=sb_log, stderr=subprocess.STDOUT)
             SB_PID_FILE.write_text(str(sb_process.pid))
             
-            cf_cmd = [str(cloudflared_path), 'tunnel', '--no-autoupdate', 'run', '--token', argo_token] if argo_token else [str(cloudflared_path), 'tunnel', '--no-autoupdate', '--url', f'http://localhost:{port_vm_ws}', '--protocol', 'http2']
+            # 强制 HTTP/2 (TCP) 而不是让 cloudflared 自动选 QUIC (UDP)。
+            # QUIC 在 UDP 被 QoS 降速/丢包的网络下抖动剧烈，表现为节点时好时坏、
+            # 页面卡在"正在打开"；HTTP/2 走 TCP 有可靠重传，稳定性好得多。
+            cf_cmd = ([str(cloudflared_path), 'tunnel', '--no-autoupdate', '--protocol', 'http2',
+                       'run', '--token', argo_token] if argo_token else
+                      [str(cloudflared_path), 'tunnel', '--no-autoupdate', '--protocol', 'http2',
+                       '--url', f'http://localhost:{port_vm_ws}'])
             cf_process = subprocess.Popen(cf_cmd, cwd=INSTALL_DIR, stdout=cf_log, stderr=subprocess.STDOUT)
             ARGO_PID_FILE.write_text(str(cf_process.pid))
 
@@ -374,6 +380,62 @@ def probe_tunnel(domain):
     except Exception as e:
         return f"❌ 探测失败: {type(e).__name__}: {e}"
 
+def end_to_end_test(domain, uuid_str, port_vm_ws):
+    """端到端自检：用一个临时 sing-box 客户端配置，经隧道访问外网，
+    验证 [客户端 -> CF边缘 -> 隧道 -> 服务端sing-box -> 出站] 整条链路。"""
+    if not domain or not uuid_str:
+        return "缺少域名或 UUID，跳过端到端自检"
+    singbox_path = INSTALL_DIR / "sing-box"
+    if not singbox_path.exists():
+        return "sing-box 不存在，跳过"
+
+    test_cfg = {
+        "log": {"level": "info"},
+        "inbounds": [{"type": "socks", "tag": "socks-in",
+                      "listen": "127.0.0.1", "listen_port": 29999}],
+        "outbounds": [{
+            "type": "vless", "tag": "proxy", "server": domain, "server_port": 443,
+            "uuid": uuid_str,
+            "tls": {"enabled": True, "server_name": domain},
+            "transport": {"type": "ws", "path": "/"},
+        }],
+    }
+    cfg_path = INSTALL_DIR / "e2e.json"
+    log_path = INSTALL_DIR / "e2e.log"
+    proc = None
+    try:
+        cfg_path.write_text(json.dumps(test_cfg, indent=2), encoding="utf-8")
+        with open(log_path, "w") as lf:
+            proc = subprocess.Popen([str(singbox_path), 'run', '-c', 'e2e.json'],
+                                    cwd=INSTALL_DIR, stdout=lf, stderr=subprocess.STDOUT)
+        time.sleep(4)
+        if proc.poll() is not None:
+            tail = "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-8:])
+            return f"❌ 自检客户端启动失败:\n{tail}"
+        # 通过这个 socks5 出口访问真实站点
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "socks5h://127.0.0.1:29999",
+                                         "https": "socks5h://127.0.0.1:29999"}))
+        req = urllib.request.Request("http://cp.cloudflare.com/generate_204",
+                                     headers={'User-Agent': 'Mozilla/5.0'})
+        with opener.open(req, timeout=25) as resp:
+            return (f"✅ 端到端链路完整可用！经隧道出站访问 Cloudflare 返回 HTTP {resp.status} "
+                    f"（说明 VLESS握手、WS 传输、TLS、隧道转发、出站全部正常）")
+    except Exception as e:
+        return f"❌ 端到端自检失败: {type(e).__name__}: {e}"
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        for f in (cfg_path, log_path):
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
 def analyze_connections():
     """按来源 IP 统计成功/失败连接，判断是哪台设备在出问题。"""
     if not SB_LOG_FILE.exists():
@@ -409,6 +471,11 @@ def get_diagnostics(domain=""):
     # 服务器端主动探测隧道（最权威的判断依据）
     out.append("--- 服务器端隧道自检 ---")
     out.append(probe_tunnel(domain))
+
+    # 端到端自检：服务器自己当客户端穿过隧道访问外网
+    out.append("--- 端到端自检（服务器当客户端穿过隧道）---")
+    uuid_for_test = st.secrets.get("UUID_STR", "") if hasattr(st, "secrets") else ""
+    out.append(end_to_end_test(domain, uuid_for_test, 0))
 
     # 二进制与版本
     for label, p in (("sing-box", singbox_path), ("cloudflared", cloudflared_path)):
