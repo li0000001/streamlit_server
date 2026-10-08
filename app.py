@@ -476,7 +476,7 @@ def websocket_probe(port, domain):
         first_line = header.split("\r\n", 1)[0]
 
         fields = {}
-        for line in header.split("\r\n")[1:\]:
+        for line in header.split("\r\n")[1:]:
             if not line:
                 break
             if ":" in line:
