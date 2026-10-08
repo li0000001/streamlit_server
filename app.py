@@ -54,6 +54,12 @@ def generate_vless_link(config):
         "sni": config.get("sni") or "",
         "host": config.get("host") or "",
         "path": "/",
+        # 关键：显式声明 flow=none。
+        # 新版客户端（Xray/v2rayN/Hiddify）导入 VLESS 链接时默认会加 flow=xtls-rprx-vision，
+        # 而 sing-box 1.14 收到 vision 流控请求时会去找 TLS Reality 的 detour 导致握手失败(EOF)。
+        "flow": "none",
+        # 部分客户端依赖这个字段来正确识别 ws 传输的伪装头类型
+        "headerType": "none",
     })
     name = urllib.parse.quote(config.get("ps") or "", safe="")
     # IPv6 地址在 URL 中必须用方括号包裹，否则端口解析会出错
