@@ -1,414 +1,446 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-# 导入所有需要的库
-import os
+"""Linux / Streamlit 命名隧道管理面板。
+依赖：streamlit>=1.37,<2, psutil>=5.9,<8, filelock>=3.13,<4
+必须配置 SECRET_KEY、UUID_STR、ARGO_TOKEN、CUSTOM_DOMAIN。
+默认端口 55555，Cloudflare 源站必须手动配置为 http://127.0.0.1:55555。
+周期检查仅在已登录页面会话活动时执行，不是独立守护服务。
+"""
+import base64
+import hashlib
+import hmac
 import json
-import random
-import time
-import shutil
-import re
-import subprocess
+import os
 import platform
-import uuid
-from pathlib import Path
-import urllib.request
-import urllib.parse
+import re
+import shutil
+import socket
+import subprocess
 import tarfile
+import tempfile
+import time
+import uuid
+from collections import deque
+from pathlib import Path
+from urllib.parse import urlencode, quote
+from urllib.request import Request, urlopen
+
+import psutil
 import streamlit as st
+from filelock import FileLock, Timeout
 
-# --- 全局常量定义 ---
-# 工作目录，所有运行时文件都将存放在这里
-INSTALL_DIR = Path.home() / ".agsb"
-# 各种运行时文件的具体路径
-SB_PID_FILE = INSTALL_DIR / "sbpid.log"
-ARGO_PID_FILE = INSTALL_DIR / "sbargopid.log"
-LIST_FILE = INSTALL_DIR / "list.txt"
-LOG_FILE = INSTALL_DIR / "argo.log"
-SB_LOG_FILE = INSTALL_DIR / "sb.log"
-ALL_NODES_FILE = INSTALL_DIR / "allnodes.txt"
-GEO_FILE = INSTALL_DIR / "geo.json"
+ROOT = Path.home() / ".agsb"
+ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+LOCK = FileLock(str(ROOT / "manager.lock"), timeout=1)
+PAUSED = ROOT / "paused"
+SB_CONFIG = ROOT / "sb.json"
 
-# --- 辅助函数 ---
 
-def download_file(url, target_path, silent=False):
-    """下载文件，可选择是否在界面上显示错误信息。"""
+def atomic_text(path, text):
+    fd, name = tempfile.mkstemp(dir=ROOT, prefix=".tmp-")
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response, open(target_path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
-        return True
-    except Exception as e:
-        if not silent:
-            st.error(f"下载失败: {url}, 错误: {e}")
-        return False
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
-def generate_vless_link(config):
-    """根据配置字典生成 VLESS 链接字符串（WebSocket + TLS）。"""
-    query = urllib.parse.urlencode({
-        "type": "ws",
-        "encryption": "none",
-        "security": "tls",
-        "sni": config.get("sni") or "",
-        "host": config.get("host") or "",
-        "path": "/",
-    })
-    name = urllib.parse.quote(config.get("ps") or "", safe="")
-    # IPv6 地址在 URL 中必须用方括号包裹，否则端口解析会出错
-    address = str(config.get("add") or "")
-    if ":" in address and not address.startswith("["):
-        address = f"[{address}]"
-    return (f"vless://{config.get('id')}@{address}:{config.get('port')}"
-            f"?{query}#{name}")
 
-def get_tunnel_domain():
-    """从argo日志文件中尝试读取Cloudflare临时隧道域名。"""
-    for _ in range(15): # 最多等待30秒
-        if LOG_FILE.exists():
-            try:
-                log_content = LOG_FILE.read_text(encoding="utf-8", errors="ignore")
-                match = re.search(r'https://([a-zA-Z0-9.-]+\.trycloudflare\.com)', log_content)
-                if match: return match.group(1)
-            except Exception: pass
-        time.sleep(2)
-    return None
-
-def stop_services():
-    """停止所有由本脚本启动的后台服务进程。"""
-    for pid_file in [SB_PID_FILE, ARGO_PID_FILE]:
-        if pid_file.exists():
-            try:
-                pid = int(pid_file.read_text().strip())
-                os.kill(pid, 9) # 强制终止进程
-            except (ValueError, ProcessLookupError, FileNotFoundError): pass
-            finally: pid_file.unlink(missing_ok=True) # 删除PID文件
-    # 作为最后的保险措施，按名字查找并杀死进程
-    subprocess.run("pkill -9 -f 'sing-box run'", shell=True, capture_output=True)
-    subprocess.run("pkill -9 -f 'cloudflared tunnel'", shell=True, capture_output=True)
-
-def is_service_running():
-    """通过检查PID文件和进程是否存在，来判断核心服务是否在运行。"""
-    if not SB_PID_FILE.exists() or not ARGO_PID_FILE.exists():
-        return False
+def read_json(path, default=None):
     try:
-        sb_pid = int(SB_PID_FILE.read_text().strip())
-        argo_pid = int(ARGO_PID_FILE.read_text().strip())
-        # 在类Unix系统中，os.kill(pid, 0) 不会杀死进程，而是检查进程是否存在
-        os.kill(sb_pid, 0)
-        os.kill(argo_pid, 0)
-        return True
-    except (ValueError, ProcessLookupError, FileNotFoundError):
-        # 如果PID文件内容错误、进程不存在或文件找不到，都视为服务未运行
-        return False
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
 
-# --- 出口IP归属地 ---
 
-# 国家代码 -> 中文名（未收录的回退到接口返回的原始名称）
-COUNTRY_CN = {
-    "AF": "阿富汗", "AL": "阿尔巴尼亚", "DZ": "阿尔及利亚", "AR": "阿根廷", "AM": "亚美尼亚",
-    "AU": "澳大利亚", "AT": "奥地利", "AZ": "阿塞拜疆", "BH": "巴林", "BD": "孟加拉国",
-    "BY": "白俄罗斯", "BE": "比利时", "BZ": "伯利兹", "BO": "玻利维亚", "BA": "波黑",
-    "BR": "巴西", "BN": "文莱", "BG": "保加利亚", "KH": "柬埔寨", "CM": "喀麦隆",
-    "CA": "加拿大", "CL": "智利", "CN": "中国", "CO": "哥伦比亚", "CR": "哥斯达黎加",
-    "HR": "克罗地亚", "CY": "塞浦路斯", "CZ": "捷克", "DK": "丹麦", "DO": "多米尼加",
-    "EC": "厄瓜多尔", "EG": "埃及", "EE": "爱沙尼亚", "ET": "埃塞俄比亚", "FI": "芬兰",
-    "FR": "法国", "GE": "格鲁吉亚", "DE": "德国", "GH": "加纳", "GR": "希腊",
-    "GT": "危地马拉", "HK": "中国香港", "HN": "洪都拉斯", "HU": "匈牙利", "IS": "冰岛",
-    "IN": "印度", "ID": "印度尼西亚", "IR": "伊朗", "IQ": "伊拉克", "IE": "爱尔兰",
-    "IL": "以色列", "IT": "意大利", "CI": "科特迪瓦", "JM": "牙买加", "JP": "日本",
-    "JO": "约旦", "KZ": "哈萨克斯坦", "KE": "肯尼亚", "KW": "科威特", "KG": "吉尔吉斯斯坦",
-    "LA": "老挝", "LV": "拉脱维亚", "LB": "黎巴嫩", "LT": "立陶宛", "LU": "卢森堡",
-    "MO": "中国澳门", "MG": "马达加斯加", "MY": "马来西亚", "MT": "马耳他", "MU": "毛里求斯",
-    "MX": "墨西哥", "MD": "摩尔多瓦", "MC": "摩纳哥", "MN": "蒙古", "ME": "黑山",
-    "MA": "摩洛哥", "MM": "缅甸", "NA": "纳米比亚", "NP": "尼泊尔", "NL": "荷兰",
-    "NZ": "新西兰", "NI": "尼加拉瓜", "NG": "尼日利亚", "KP": "朝鲜", "MK": "北马其顿",
-    "NO": "挪威", "OM": "阿曼", "PK": "巴基斯坦", "PA": "巴拿马", "PY": "巴拉圭",
-    "PE": "秘鲁", "PH": "菲律宾", "PL": "波兰", "PT": "葡萄牙", "PR": "波多黎各",
-    "QA": "卡塔尔", "RO": "罗马尼亚", "RU": "俄罗斯", "SA": "沙特阿拉伯", "RS": "塞尔维亚",
-    "SG": "新加坡", "SK": "斯洛伐克", "SI": "斯洛文尼亚", "ZA": "南非", "KR": "韩国",
-    "ES": "西班牙", "LK": "斯里兰卡", "SE": "瑞典", "CH": "瑞士", "SY": "叙利亚",
-    "TW": "中国台湾", "TJ": "塔吉克斯坦", "TZ": "坦桑尼亚", "TH": "泰国", "TN": "突尼斯",
-    "TR": "土耳其", "TM": "土库曼斯坦", "UG": "乌干达", "UA": "乌克兰", "AE": "阿联酋",
-    "GB": "英国", "US": "美国", "UY": "乌拉圭", "UZ": "乌兹别克斯坦", "VE": "委内瑞拉",
-    "VN": "越南", "YE": "也门", "ZM": "赞比亚", "ZW": "津巴布韦",
-}
+def log_event(text):
+    with (ROOT / "manager.log").open("a", encoding="utf-8") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
 
-def get_exit_country():
-    """查询本机出口IP及其归属国家，结果缓存到 GEO_FILE。返回 (国家中文名, 出口IP)。"""
-    if GEO_FILE.exists():
+
+def tail(path, count=100):
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            return "".join(deque(f, maxlen=count))
+    except OSError:
+        return "暂无日志"
+
+
+def redact(text, cfg):
+    for key in ("token", "secret", "uuid"):
+        text = text.replace(cfg[key], "[已隐藏]")
+    return re.sub(r"vless://[^\s]+", "[节点链接已隐藏]", text)
+
+
+def load_config():
+    if platform.system() != "Linux":
+        raise ValueError("此版本仅支持 Linux 部署环境。")
+    secret = str(st.secrets.get("SECRET_KEY", "")).strip()
+    token = str(st.secrets.get("ARGO_TOKEN", "")).strip()
+    uid = str(st.secrets.get("UUID_STR", "")).strip()
+    domain = str(st.secrets.get("CUSTOM_DOMAIN", "")).strip().lower()
+    if not all((secret, token, uid, domain)):
+        raise ValueError("请设置 SECRET_KEY、ARGO_TOKEN、UUID_STR、CUSTOM_DOMAIN；不再随机生成 UUID。")
+    uid = str(uuid.UUID(uid))
+    if len(secret) < 16:
+        raise ValueError("SECRET_KEY 至少需要 16 个字符。")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", domain) or "." not in domain:
+        raise ValueError("CUSTOM_DOMAIN 只填写域名，不带协议、端口或路径。")
+    port = int(st.secrets.get("PORT_VM_WS", 55555))
+    metrics = int(st.secrets.get("METRICS_PORT", 55556))
+    if not (1024 <= port <= 65535 and 1024 <= metrics <= 65535) or port == metrics:
+        raise ValueError("服务端口和监控端口必须不同，范围为 1024 至 65535。")
+    protocol = str(st.secrets.get("TUNNEL_PROTOCOL", "http2"))
+    if protocol not in ("http2", "quic", "auto"):
+        raise ValueError("TUNNEL_PROTOCOL 必须为 http2、quic 或 auto。")
+    version = str(st.secrets.get("SINGBOX_VERSION", "1.14.2"))
+    cf_version = str(st.secrets.get("CLOUDFLARED_VERSION", "latest"))
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("SINGBOX_VERSION 必须是稳定版本号。")
+    if cf_version != "latest" and not re.fullmatch(r"\d+\.\d+\.\d+", cf_version):
+        raise ValueError("CLOUDFLARED_VERSION 必须为 latest 或版本号。")
+    return dict(secret=secret, token=token, uuid=uid, domain=domain,
+                port=port, metrics=metrics, protocol=protocol,
+                sb_version=version, cf_version=cf_version)
+
+
+def get_bytes(url, timeout=30):
+    req = Request(url, headers={"User-Agent": "agsb-manager", "Accept": "application/json"})
+    with urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+def install_binary(repo, tag, asset_name, target, archive=False):
+    """只取官方 GitHub Release；若提供 SHA256 digest 则验证。
+    压缩包只读取一个普通文件，不执行 extractall。
+    """
+    if target.exists():
+        return
+    endpoint = "latest" if tag == "latest" else "tags/" + tag
+    release = json.loads(get_bytes(f"https://api.github.com/repos/{repo}/releases/{endpoint}"))
+    asset = next((a for a in release["assets"] if a["name"] == asset_name), None)
+    if not asset:
+        raise RuntimeError(f"官方 Release 中没有 {asset_name}")
+    fd, temp_name = tempfile.mkstemp(dir=ROOT, prefix=".download-")
+    temp = Path(temp_name)
+    try:
+        req = Request(asset["browser_download_url"], headers={"User-Agent": "agsb-manager"})
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out, urlopen(req, timeout=60) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        expected = asset.get("digest") or ""
+        if expected.startswith("sha256:"):
+            if not hmac.compare_digest(digest.hexdigest(), expected[7:]):
+                raise RuntimeError("下载文件 SHA256 校验失败。")
+        else:
+            log_event(f"{asset_name} 未提供 SHA256 digest，仅通过 HTTPS 下载。")
+        if archive:
+            with tarfile.open(temp, "r:gz") as tar:
+                members = [m for m in tar.getmembers() if m.isfile() and Path(m.name).name == "sing-box"]
+                if len(members) != 1:
+                    raise RuntimeError("压缩包内核心文件数量异常。")
+                with tar.extractfile(members[0]) as src, target.with_suffix(".tmp").open("wb") as out:
+                    shutil.copyfileobj(src, out)
+            os.chmod(target.with_suffix(".tmp"), 0o700)
+            os.replace(target.with_suffix(".tmp"), target)
+        else:
+            os.chmod(temp, 0o700)
+            os.replace(temp, target)
+        log_event(f"已安装 {asset_name}")
+    finally:
+        temp.unlink(missing_ok=True)
+        target.with_suffix(".tmp").unlink(missing_ok=True)
+
+
+def binaries(cfg):
+    machine = platform.machine().lower()
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if not arch:
+        raise ValueError(f"不支持的架构：{machine}")
+    sb = ROOT / f"sing-box-{cfg['sb_version']}-{arch}"
+    cf = ROOT / f"cloudflared-{cfg['cf_version']}-{arch}"
+    install_binary("SagerNet/sing-box", "v" + cfg["sb_version"],
+                   f"sing-box-{cfg['sb_version']}-linux-{arch}.tar.gz", sb, True)
+    install_binary("cloudflare/cloudflared", cfg["cf_version"], f"cloudflared-linux-{arch}", cf)
+    return sb, cf
+
+
+def process(name):
+    record = read_json(ROOT / f"{name}.pid.json", {})
+    try:
+        p = psutil.Process(record["pid"])
+        if abs(p.create_time() - record["created"]) > 0.01:
+            return None
+        if p.status() == psutil.STATUS_ZOMBIE or not p.is_running():
+            return None
+        if Path(p.exe()).resolve() != Path(record["exe"]).resolve():
+            return None
+        return p
+    except (KeyError, psutil.Error, OSError):
+        return None
+
+
+def stop_one(name):
+    p = process(name)
+    if p:
         try:
-            saved = json.loads(GEO_FILE.read_text(encoding="utf-8"))
-            if saved.get("country"):
-                return saved["country"], saved.get("ip", "")
-        except Exception:
+            p.terminate()
+            try:
+                p.wait(timeout=8)
+            except psutil.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=3)
+            log_event(f"已停止 {name}")
+        except psutil.NoSuchProcess:
             pass
+    (ROOT / f"{name}.pid.json").unlink(missing_ok=True)
 
-    # 三个备用接口，依次尝试（都不要求 API Key）
-    apis = [
-        ("https://ipwho.is/",       lambda d: (d.get("country"), d.get("country_code"), d.get("ip"))),
-        ("https://ipapi.co/json/",  lambda d: (d.get("country_name"), d.get("country_code"), d.get("ip"))),
-        ("http://ip-api.com/json/", lambda d: (d.get("country"), d.get("countryCode"), d.get("query"))),
-    ]
-    for url, pick in apis:
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            country_raw, code, ip = pick(data)
-            if not country_raw and not code:
-                continue
-            cn = COUNTRY_CN.get((code or "").upper()) or country_raw
-            try:
-                GEO_FILE.write_text(
-                    json.dumps({"country": cn, "code": code or "", "ip": ip or ""}, ensure_ascii=False),
-                    encoding="utf-8")
-            except Exception:
-                pass
-            return cn, ip or ""
-        except Exception:
-            continue
-    return None, None
 
-# --- 核心逻辑 ---
-
-def generate_all_configs(domain, uuid_str, port_vm_ws):
-    """生成所有节点链接和配置文件，并返回用于UI显示的文本。"""
-    # 让 Streamlit 服务端查询自己的出口IP归属地，用国家名做节点名前缀
-    country, exit_ip = get_exit_country()
-    region = country or "未知"
-    protocol = "VLWS-TLS"
-    all_links = []
-    # 使用一些Cloudflare的优选IP来生成节点（只保留 IPv4/域名，避免 IPv6 劣质路由导致连接失败）
-    cf_ips_tls = {"www.visa.com": "443",
-            "japan.com": "443",
-            "www.iplocation.net": "443",
-            "time.is": "443",
-            "ip.sb": "443",
-            "openai.com": "443",
-            "saas.sin.fan": "443",
-            "104.16.0.0": "443",
-            "104.17.0.0": "8443",
-            "104.18.0.0": "2053",
-            "104.19.0.0": "2083",
-            "104.20.0.0": "2087"}
-    # 再过滤一遍：地址里带冒号的是 IPv6，直接跳过（IPv6 路由不佳时会导致测试 -1）
-    cf_ips_v4 = {ip: port for ip, port in cf_ips_tls.items() if ":" not in str(ip)}
-    # 节点名格式：国家-协议名称-序号（序号按字典插入顺序，从 1 开始）
-    for idx, (ip, port) in enumerate(cf_ips_v4.items(), start=1):
-        all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-{idx}", "add": ip, "port": port, "id": uuid_str, "host": domain, "sni": domain}))
-    all_links.append(generate_vless_link({"ps": f"{region}-{protocol}-Direct-{len(cf_ips_v4) + 1}", "add": domain, "port": "443", "id": uuid_str, "host": domain, "sni": domain}))
-    
-    # 将所有链接写入文件，以便下次直接读取
-    ALL_NODES_FILE.write_text("\n".join(all_links) + "\n", encoding="utf-8")
-
-    # 准备要在UI上显示的输出文本
-    list_output_text = f"""
-✅ **服务已启动**
----
-- **域名 (Domain):** `{domain}`
-- **出口IP:** `{exit_ip or '查询失败'}`
-- **归属地:** `{region}`
-- **UUID:** `{uuid_str}`
-- **本地端口:** `{port_vm_ws}`
-- **WebSocket路径:** `/`
----
-**VLESS 链接 (可复制):**
-""" + "\n".join(all_links)
-    
-    # 将UI文本也写入文件
-    LIST_FILE.write_text(list_output_text, encoding="utf-8")
-    return list_output_text
-
-def start_services(uuid_str, port_vm_ws, custom_domain, argo_token, silent=False):
-    """核心函数：安装并启动服务，可选择静默模式。"""
-    
-    if not silent:
-        st.info("🔄 正在启动/重启服务...")
-
-    stop_services()
-    
+def launch(name, command, fingerprint, env=None):
+    path = ROOT / f"{name}.log"
+    # 只在启动前轮换日志，不截断正在使用的日志。
+    if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+        os.replace(path, ROOT / f"{name}.log.1")
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n" + time.strftime("%Y-%m-%d %H:%M:%S") + " 启动进程\n")
+        f.flush()
+        child = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                                 stdout=f, stderr=subprocess.STDOUT,
+                                 env=env, start_new_session=True)
     try:
-        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        
-        uuid_str = uuid_str or str(uuid.uuid4())
-        port_vm_ws = port_vm_ws or random.randint(10000, 65535)
-
-        # 定义依赖项及其下载逻辑
-        arch = "amd64" if "x86_64" in platform.machine().lower() else "arm64"
-        singbox_path = INSTALL_DIR / "sing-box"
-        cloudflared_path = INSTALL_DIR / "cloudflared"
-
-        # 封装下载和安装过程
-        def install_dependencies():
-            if not singbox_path.exists():
-                sb_version, sb_name_actual = "1.14.2", f"sing-box-1.14.2-linux-{arch}"
-                tar_path = INSTALL_DIR / "sing-box.tar.gz"
-                if not download_file(f"https://github.com/SagerNet/sing-box/releases/download/v{sb_version}/{sb_name_actual}.tar.gz", tar_path, silent):
-                    return False, "sing-box 下载失败。"
-                with tarfile.open(tar_path, "r:gz") as tar: tar.extractall(path=INSTALL_DIR)
-                shutil.move(INSTALL_DIR / sb_name_actual / "sing-box", singbox_path)
-                shutil.rmtree(INSTALL_DIR / sb_name_actual); tar_path.unlink(); os.chmod(singbox_path, 0o755)
-
-            if not cloudflared_path.exists():
-                cf_arch = "amd64" if arch == "amd64" else "arm"
-                if not download_file(f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{cf_arch}", cloudflared_path, silent):
-                    return False, "cloudflared 下载失败。"
-                os.chmod(cloudflared_path, 0o755)
-            return True, ""
-
-        # 根据是否为静默模式，决定是否显示 spinner
-        if not silent:
-            with st.spinner("正在检查并安装依赖 (sing-box, cloudflared)..."):
-                success, msg = install_dependencies()
-                if not success: return False, msg
-        else:
-            success, msg = install_dependencies()
-            if not success: return False, msg
-
-        # 创建 sing-box 配置文件
-        # 注意：不要加 "sniff" 等旧版 inbound 字段——sing-box 1.13+ 会直接拒绝该配置并退出
-        sb_config = {"log": {"level": "info"},
-                     "inbounds": [{"type": "vless", "tag": "vless-in", "listen": "127.0.0.1",
-                                   "listen_port": port_vm_ws,
-                                   "users": [{"uuid": uuid_str}],
-                                   "transport": {"type": "ws", "path": "/"}}],
-                     "outbounds": [{"type": "direct"}]}
-        (INSTALL_DIR / "sb.json").write_text(json.dumps(sb_config, indent=2))
-        
-        # 启动 sing-box 和 cloudflared 进程
-        with open(SB_LOG_FILE, "w") as sb_log, open(LOG_FILE, "w") as cf_log:
-            sb_process = subprocess.Popen([str(singbox_path), 'run', '-c', 'sb.json'], cwd=INSTALL_DIR, stdout=sb_log, stderr=subprocess.STDOUT)
-            SB_PID_FILE.write_text(str(sb_process.pid))
-            
-            cf_cmd = [str(cloudflared_path), 'tunnel', '--no-autoupdate', 'run', '--token', argo_token] if argo_token else [str(cloudflared_path), 'tunnel', '--no-autoupdate', '--url', f'http://localhost:{port_vm_ws}', '--protocol', 'http2']
-            cf_process = subprocess.Popen(cf_cmd, cwd=INSTALL_DIR, stdout=cf_log, stderr=subprocess.STDOUT)
-            ARGO_PID_FILE.write_text(str(cf_process.pid))
-
-        # 等待并获取域名
-        time.sleep(5)
-
-        # 验证进程没有启动即退出：配置不兼容时 sing-box 会立刻报错退出，
-        # 以前不检查会让界面显示"服务已启动"但所有节点实际都是 -1
-        def _log_tail(path, lines=12):
+        p = psutil.Process(child.pid)
+        record = dict(pid=child.pid, created=p.create_time(), exe=str(Path(command[0]).resolve()),
+                      fingerprint=fingerprint)
+        atomic_text(ROOT / f"{name}.pid.json", json.dumps(record))
+        time.sleep(0.3)
+        if child.poll() is not None:
+            raise RuntimeError(f"{name} 启动即退出，请查看对应日志。")
+    except Exception:
+        if child.poll() is None:
+            child.terminate()
             try:
-                return "\n".join(path.read_text(encoding="utf-8", errors="ignore").splitlines()[-lines:])
-            except Exception:
-                return "(无法读取日志)"
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        raise
+    log_event(f"已启动 {name} PID={child.pid}")
 
-        if sb_process.poll() is not None:
-            stop_services()
-            return False, (f"sing-box 启动失败 (exit code {sb_process.returncode})，"
-                           f"配置不兼容或端口被占用。日志最后几行：\n{_log_tail(SB_LOG_FILE)}")
-        if cf_process.poll() is not None:
-            stop_services()
-            return False, (f"cloudflared 启动失败 (exit code {cf_process.returncode})，"
-                           f"请检查 ARGO_TOKEN。日志最后几行：\n{_log_tail(LOG_FILE)}")
 
-        final_domain = custom_domain or (get_tunnel_domain() if not argo_token else None)
-        if not final_domain:
-            return False, "未能确定隧道域名。请检查日志 (`.agsb/argo.log`)。"
+def websocket_probe(host, port, domain):
+    """只检查 WebSocket 握手，不代表 VLESS 鉴权或完整代理链路成功。"""
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (f"GET / HTTP/1.1\r\nHost: {domain}\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n")
+    try:
+        with socket.create_connection((host, port), timeout=2) as sock:
+            sock.sendall(request.encode("ascii"))
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 16384:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        line = data.split(b"\r\n", 1)[0].decode(errors="replace")
+        return " 101 " in line, line or "无响应"
+    except OSError as e:
+        return False, str(e)
 
-        links_output = generate_all_configs(final_domain, uuid_str, port_vm_ws)
-        return True, links_output
-    
+
+def tunnel_connections(cfg):
+    try:
+        text = get_bytes(f"http://127.0.0.1:{cfg['metrics']}/metrics", timeout=2).decode()
+        values = re.findall(r"^cloudflared_tunnel_ha_connections(?:\{[^\n]*\})?\s+([0-9.eE+-]+)$", text, re.M)
+        return sum(float(v) for v in values) if values else None
+    except Exception:
+        return None
+
+
+def fingerprint(data):
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def ensure_services(cfg, force=None, manual=False):
+    """必须在 LOCK 内调用。自动恢复只针对进程退出，不因单次探测失败重启。"""
+    if PAUSED.exists() and not manual:
+        return
+    state_path = ROOT / "attempts.json"
+    attempts = read_json(state_path, {})
+    now = time.time()
+    if not manual and now - attempts.get("last", 0) < attempts.get("delay", 0):
+        return
+    sb_data = {
+        "log": {"level": "info", "timestamp": True},
+        "inbounds": [{"type": "vless", "tag": "vless-in", "listen": "127.0.0.1",
+                      "listen_port": cfg["port"], "users": [{"uuid": cfg["uuid"]}],
+                      "transport": {"type": "ws", "path": "/"}}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+    }
+    sb_fp = fingerprint([sb_data, cfg["sb_version"]])
+    cf_fp = fingerprint([cfg["token"], cfg["protocol"], cfg["metrics"], cfg["cf_version"]])
+    need = {}
+    for name, fp in (("sb", sb_fp), ("argo", cf_fp)):
+        record = read_json(ROOT / f"{name}.pid.json", {})
+        need[name] = process(name) is None or record.get("fingerprint") != fp or force in (name, "all")
+    if not any(need.values()):
+        return
+    try:
+        sb, cf = binaries(cfg)
+        if need["sb"]:
+            # 在停止旧服务之前先校验新配置。
+            candidate = ROOT / "sb.candidate.json"
+            atomic_text(candidate, json.dumps(sb_data, indent=2))
+            checked = subprocess.run([str(sb), "check", "-c", str(candidate)],
+                                     capture_output=True, text=True, timeout=15)
+            if checked.returncode:
+                raise RuntimeError("sing-box 配置校验失败：" + checked.stderr[-2000:])
+            stop_one("sb")
+            os.replace(candidate, SB_CONFIG)
+            launch("sb", [str(sb), "run", "-c", str(SB_CONFIG)], sb_fp)
+            ok = False
+            for _ in range(15):
+                ok, _ = websocket_probe("127.0.0.1", cfg["port"], cfg["domain"])
+                if ok:
+                    break
+                if process("sb") is None:
+                    break
+                time.sleep(0.2)
+            if not ok:
+                stop_one("sb")
+                raise RuntimeError("本地 WebSocket 握手未成功，已停止本次启动的 sing-box，请查看日志。")
+        if need["argo"]:
+            stop_one("argo")
+            env = os.environ.copy()
+            env["TUNNEL_TOKEN"] = cfg["token"]
+            launch("argo", [str(cf), "tunnel", "--no-autoupdate", "--protocol", cfg["protocol"],
+                            "--metrics", f"127.0.0.1:{cfg['metrics']}", "--loglevel", "info",
+                            "run"], cf_fp, env)
+        atomic_text(state_path, json.dumps({"last": now, "delay": 10}))
+        (ROOT / "last_error.txt").unlink(missing_ok=True)
     except Exception as e:
-        return False, f"处理过程中发生意外错误: {e}"
+        delay = min(300, max(15, attempts.get("delay", 0) * 2))
+        atomic_text(state_path, json.dumps({"last": now, "delay": delay}))
+        message = redact(str(e), cfg)
+        atomic_text(ROOT / "last_error.txt", message)
+        log_event("启动失败：" + message)
+        raise
 
-def uninstall_services():
-    """卸载服务，清理所有运行时文件和进程。"""
-    stop_services()
-    if INSTALL_DIR.exists(): shutil.rmtree(INSTALL_DIR)
-    st.success("✅ 卸载完成。所有运行时文件和进程已清除。")
-    st.session_state.clear()
 
-# --- UI 渲染函数 ---
+def node_link(cfg):
+    query = urlencode(dict(type="ws", encryption="none", security="tls",
+                           sni=cfg["domain"], host=cfg["domain"], path="/"))
+    return f"vless://{cfg['uuid']}@{cfg['domain']}:443?{query}#{quote('VLWS-TLS-Direct')}"
 
-def render_main_ui(config):
-    """渲染主控制面板。"""
-    st.set_page_config(page_title="部署工具", layout="wide")
-    st.header("⚙️ 服务管理面板")
 
-    st.subheader("控制操作")
-    c1, c2, c3 = st.columns(3)
-    
-    if c1.button("🚀 强制重启服务", type="primary", use_container_width=True):
-        # 手动点击按钮时，调用非静默模式，让用户看到反馈
-        success, message = start_services(config["uuid_str"], config["port_vm_ws"], config["custom_domain"], config["argo_token"], silent=False)
-        if success:
-            st.session_state.output = message
-        else:
-            st.error(f"操作失败: {message}")
-            st.session_state.output = message
-        st.rerun()
-
-    if c2.button("❌ 永久卸载服务", use_container_width=True):
-        with st.spinner("正在执行卸载..."):
-            uninstall_services()
-        st.rerun()
-    
-    if c3.button("📄 显示/刷新节点信息", use_container_width=True):
-        if LIST_FILE.exists():
-            st.session_state.output = LIST_FILE.read_text(encoding="utf-8")
-        else:
-            st.session_state.output = "节点信息文件不存在，请先启动服务。"
-        st.rerun()
-    
-    # 优先从会话状态中读取输出，如果为空则尝试从文件读取
-    output_to_show = st.session_state.get('output', '')
-    if not output_to_show and LIST_FILE.exists():
-        output_to_show = LIST_FILE.read_text(encoding="utf-8")
-        
-    if output_to_show:
-        st.subheader("节点信息")
-        st.code(output_to_show)
-
-def render_login_ui(secret_key):
-    """渲染伪装的天气查询登录界面。"""
-    st.set_page_config(page_title="天气查询", layout="centered")
-    st.title("🌦️ 实时天气查询")
-    city = st.text_input("请输入城市名或秘密口令：", "")
-    if st.button("查询天气"):
-        if city == secret_key:
+def login(cfg):
+    if st.session_state.get("authenticated"):
+        return True
+    st.title("服务管理登录")
+    with st.form("login"):
+        password = st.text_input("管理口令", type="password")
+        submitted = st.form_submit_button("登录")
+    if submitted:
+        now = time.time()
+        if now < st.session_state.get("login_after", 0):
+            st.error("尝试过于频繁，请稍后重新登录。")
+        elif hmac.compare_digest(password.encode(), cfg["secret"].encode()):
             st.session_state.authenticated = True
             st.rerun()
         else:
-            with st.spinner(f"正在查询 {city} 的天气..."): time.sleep(1); st.error("查询失败，请检查城市名是否正确。")
+            st.session_state.login_after = now + 3
+            st.error("口令错误。")
+    st.caption("这是简单管理口令，不替代正式身份认证；仅向可信用户开放面板。")
+    return False
+
+
+@st.fragment(run_every="15s")
+def status_panel(cfg):
+    if not PAUSED.exists():
+        try:
+            with LOCK:
+                ensure_services(cfg)
+        except Timeout:
+            st.info("其他会话正在操作服务，本次跳过恢复。")
+        except Exception as e:
+            st.error(redact(str(e), cfg))
+    sb_alive = process("sb") is not None
+    cf_alive = process("argo") is not None
+    ws_ok, ws_message = websocket_probe("127.0.0.1", cfg["port"], cfg["domain"]) if sb_alive else (False, "进程未运行")
+    connections = tunnel_connections(cfg) if cf_alive else None
+    c1, c2, c3 = st.columns(3)
+    c1.metric("sing-box 进程", "运行" if sb_alive else "停止")
+    c2.metric("本地 WS 握手", "成功" if ws_ok else "失败")
+    c3.metric("隧道活动连接", "未知" if connections is None else str(int(connections)))
+    st.caption(f"cloudflared 进程：{'运行' if cf_alive else '停止'}；本地探测：{ws_message}")
+    if PAUSED.exists():
+        st.warning("服务已暂停，自动恢复关闭。")
+    elif ws_ok and connections is not None and connections > 0:
+        st.success("本地握手成功，隧道存在活动连接；尚未验证客户端完整代理链路。")
+    else:
+        st.warning("服务尚未就绪或状态异常，请查看日志。不会因一次探测失败重启存活进程。")
+    error_path = ROOT / "last_error.txt"
+    if error_path.exists():
+        st.error(redact(error_path.read_text(encoding="utf-8"), cfg))
+    with st.expander("最近日志", expanded=False):
+        for name in ("sb", "argo", "manager"):
+            st.text(name)
+            st.code(redact(tail(ROOT / f"{name}.log"), cfg), language="text")
+
 
 def main():
-    """主应用逻辑：先执行后台自愈，再根据登录状态渲染UI。"""
-    st.session_state.setdefault('authenticated', False)
-    st.session_state.setdefault('output', "")
-    
+    st.set_page_config(page_title="隧道服务管理", layout="wide")
     try:
-        secret_key = st.secrets["SECRET_KEY"]
-        config = {
-            "uuid_str": st.secrets.get("UUID_STR", ""),
-            "port_vm_ws": st.secrets.get("PORT_VM_WS", 0),
-            "custom_domain": st.secrets.get("CUSTOM_DOMAIN", ""),
-            "argo_token": st.secrets.get("ARGO_TOKEN", "")
-        }
-    except KeyError:
-        st.error("严重错误：未在 Secrets 中找到 'SECRET_KEY'。")
-        st.info("请确保您已在 Streamlit Cloud 的设置中添加了名为 'SECRET_KEY' 的密钥。")
+        cfg = load_config()
+    except Exception as e:
+        st.error(f"配置读取失败：{e}")
+        st.stop()
+    if not login(cfg):
         return
+    st.title("隧道服务管理")
+    st.caption("固定 UUID / 固定端口 / 独立进程恢复 / 命名隧道 / Direct 节点")
+    if st.sidebar.button("退出登录"):
+        st.session_state.authenticated = False
+        st.rerun()
+    st.info(f"Cloudflare 对应域名的源站应为 http://127.0.0.1:{cfg['port']}；本程序不会修改控制台路由。")
+    options = {
+        "启动 / 恢复": None,
+        "仅重启 sing-box": "sb",
+        "仅重启隧道": "argo",
+        "重启全部": "all",
+        "暂停服务": "stop",
+    }
+    action = st.selectbox("操作", list(options))
+    if st.button("执行操作", type="primary"):
+        try:
+            with LOCK:
+                if options[action] == "stop":
+                    atomic_text(PAUSED, "paused")
+                    stop_one("argo")
+                    stop_one("sb")
+                else:
+                    PAUSED.unlink(missing_ok=True)
+                    with st.spinner("检查配置并执行操作..."):
+                        ensure_services(cfg, force=options[action], manual=True)
+            st.success("操作完成；实际连接状态见下方。")
+        except Timeout:
+            st.warning("已有操作正在执行，本次未执行。")
+        except Exception as e:
+            st.error(redact(str(e), cfg))
+    status_panel(cfg)
+    st.subheader("Direct 节点")
+    st.caption("链接含访问凭据，请勿公开。暂停或异常时，链接仍可显示，但不代表服务可用。")
+    link = node_link(cfg)
+    st.code(link, language="text")
+    st.download_button("下载节点链接", link + "\n", file_name="nodes.txt", mime="text/plain")
+    st.caption("自动检查仅在已登录页面会话活动时运行；不提供平台休眠期间的保活保证。")
 
-    # --- 核心自愈逻辑 ---
-    # 在渲染任何UI之前，先检查服务状态。如果服务未运行，就以“静默模式”在后台启动它。
-    if not is_service_running():
-        start_services(
-            config["uuid_str"], config["port_vm_ws"], 
-            config["custom_domain"], config["argo_token"], 
-            silent=True
-        )
-        
-    # --- UI渲染逻辑 ---
-    # 后台任务处理完毕后，才开始决定显示哪个页面
-    if st.session_state.authenticated:
-        # 如果已登录，显示主控制面板
-        render_main_ui(config)
-    else:
-        # 如果未登录，显示伪装的天气查询页面
-        render_login_ui(secret_key)
 
 if __name__ == "__main__":
     main()
